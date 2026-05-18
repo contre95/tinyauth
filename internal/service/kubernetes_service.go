@@ -58,6 +58,11 @@ var watchedGVRs = []schema.GroupVersionResource{
 		Version:  "v1",
 		Resource: "httproutes",
 	},
+	{
+		Group:    "gateway.networking.k8s.io",
+		Version:  "v1",
+		Resource: "grpcroutes",
+	},
 }
 
 func NewKubernetesService(

@@ -195,6 +195,25 @@ func TestKubernetesService(t *testing.T) {
 			},
 		},
 		{
+			description: "UpdateFromItem parses annotations and populates cache from grpcroute",
+			run: func(t *testing.T, svc *KubernetesService) {
+				item := unstructured.Unstructured{}
+				item.SetNamespace("default")
+				item.SetName("test-grpcroute")
+				item.SetAnnotations(map[string]string{
+					"tinyauth.apps.grpcapp.config.domain": "grpcapp.example.com",
+					"tinyauth.apps.grpcapp.users.allow":   "carol",
+				})
+
+				svc.updateFromItem(&item)
+
+				got := svc.getByDomain("grpcapp.example.com")
+				require.NotNil(t, got)
+				assert.Equal(t, "grpcapp.example.com", got.Config.Domain)
+				assert.Equal(t, "carol", got.Users.Allow)
+			},
+		},
+		{
 			description: "Ingress and HTTPRoute apps coexist in cache",
 			run: func(t *testing.T, svc *KubernetesService) {
 				ingress := unstructured.Unstructured{}
