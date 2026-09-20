@@ -28,7 +28,7 @@ func (k *KubernetesGRPCRouteExtractor) getHosts(hostnames []gateway.Hostname) []
 		}
 	}
 
-	return nil
+	return hosts
 }
 
 func (k *KubernetesGRPCRouteExtractor) Extract(route *gateway.GRPCRoute) *ExtractionResult {

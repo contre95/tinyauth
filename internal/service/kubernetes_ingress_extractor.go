@@ -24,6 +24,10 @@ func NewKubernetesIngressExtractor(i KubernetesIngressExtractorInput) *Kubernete
 func (k *KubernetesIngressExtractor) getPaths(rule networking.IngressRule) []string {
 	var paths []string
 
+	if rule.HTTP == nil {
+		return paths
+	}
+
 	for _, path := range rule.HTTP.Paths {
 		paths = append(paths, path.Path)
 	}
@@ -47,15 +51,11 @@ func (k *KubernetesIngressExtractor) getHosts(rules []networking.IngressRule) []
 		}
 	}
 
-	return nil
+	return hosts
 }
 
 func (k *KubernetesIngressExtractor) Extract(ingress *networking.Ingress) *ExtractionResult {
 	annotations := ingress.GetAnnotations()
-	if len(annotations) == 0 {
-		return nil
-	}
-
 	hosts := k.getHosts(ingress.Spec.Rules)
 
 	return &ExtractionResult{

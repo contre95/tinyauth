@@ -30,28 +30,31 @@ func (k *KubernetesHTTPRouteExtractor) getHosts(hostnames []gateway.Hostname) []
 		}
 	}
 
-	return nil
+	return hosts
 }
 
 func (k *KubernetesHTTPRouteExtractor) getRuleMatchers(matchers []gateway.HTTPRouteMatch) []string {
 	var res []string
 
 	for _, m := range matchers {
-		pathType := m.Path.Type
-		if pathType == nil {
-			pathType = new(gateway.PathMatchPathPrefix)
-		}
-
-		pathValue := m.Path.Value
-		if pathValue == nil {
-			pathValue = new("/")
-		}
-
-		if *pathType != gateway.PathMatchPathPrefix {
+		if m.Path == nil {
+			res = append(res, "/")
 			continue
 		}
 
-		res = append(res, *pathValue)
+		pathType := gateway.PathMatchPathPrefix
+		if m.Path.Type != nil {
+			pathType = *m.Path.Type
+		}
+		if pathType != gateway.PathMatchPathPrefix {
+			continue
+		}
+
+		pathValue := "/"
+		if m.Path.Value != nil {
+			pathValue = *m.Path.Value
+		}
+		res = append(res, pathValue)
 	}
 
 	return res
@@ -61,6 +64,10 @@ func (k *KubernetesHTTPRouteExtractor) getPaths(rules []gateway.HTTPRouteRule) [
 	var paths []string
 
 	for _, rule := range rules {
+		if len(rule.Matches) == 0 {
+			paths = append(paths, "/")
+			continue
+		}
 		matchers := k.getRuleMatchers(rule.Matches)
 		paths = append(paths, matchers...)
 	}

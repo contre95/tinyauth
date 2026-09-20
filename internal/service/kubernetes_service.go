@@ -69,7 +69,8 @@ var supportedResources = []watchedResource{
 }
 
 func hostMatchesHostname(host string, hostname string) bool {
-	host = strings.ToLower(host)
+	host = normalizeDomain(host)
+	hostname = normalizeDomain(hostname)
 	if suffix, ok := strings.CutPrefix(host, "*."); ok {
 		return strings.HasSuffix(hostname, "."+suffix)
 	}
@@ -284,21 +285,26 @@ func (k *KubernetesService) getEntry(domain string, locator func(name string, ap
 func (k *KubernetesService) updateFromItem(res watchedResource, typedItem *typedItem) {
 	var result *ExtractionResult
 
+	if typedItem == nil {
+		k.log.App.Warn().Str("res", res.pretty()).Msg("Resource is nil, skipping")
+		return
+	}
+
 	switch typedItem.typ {
 	case ResourceTypeIngress:
-		if typedItem.ingress != nil {
+		if typedItem.ingress == nil {
 			k.log.App.Warn().Str("res", res.pretty()).Msg("Ingress is nil, skipping")
 			return
 		}
 		result = k.extractors.ingress.Extract(typedItem.ingress)
 	case ResourceTypeHTTPRoute:
-		if typedItem.route != nil {
+		if typedItem.route == nil {
 			k.log.App.Warn().Str("res", res.pretty()).Msg("HTTPRoute is nil, skipping")
 			return
 		}
 		result = k.extractors.httproute.Extract(typedItem.route)
 	case ResourceTypeGRPCRoute:
-		if typedItem.grpc != nil {
+		if typedItem.grpc == nil {
 			k.log.App.Warn().Str("res", res.pretty()).Msg("GRPCRoute is nil, skipping")
 			return
 		}
