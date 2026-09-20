@@ -12,42 +12,43 @@ import (
 	"github.com/tinyauthapp/tinyauth/internal/model"
 	"github.com/tinyauthapp/tinyauth/internal/utils/decoders"
 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
-	"github.com/tinyauthapp/tinyauth/pkg/validators"
 	"go.uber.org/dig"
-
+	networking "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
+	gateway "sigs.k8s.io/gateway-api/apis/v1"
 )
 
-// watchedResource describes a kind of resource that can carry tinyauth
-// annotations, along with the specifics of extracting the hosts it routes.
 type watchedResource struct {
 	gvr schema.GroupVersionResource
-	// gatewayAPI resources declare their hosts in spec.hostnames instead of
-	// spec.rules[].host and may use the wildcard label (`*.`).
-	gatewayAPI bool
-	// httpPaths marks resources that route on HTTP paths, which means another
-	// resource may claim the same host on a different path.
-	httpPaths bool
+	typ ResourceType
 }
 
-// api returns a human readable identifier for the watched resource.
-func (r watchedResource) api() string {
-	return r.gvr.GroupVersion().String() + "/" + r.gvr.Resource
+func (w watchedResource) pretty() string {
+	return w.gvr.Group + "/" + w.gvr.Version + "/" + w.gvr.Resource
 }
 
-var watchedResources = []watchedResource{
+type ResourceType string
+
+const (
+	ResourceTypeIngress   ResourceType = "ingress"
+	ResourceTypeGRPCRoute ResourceType = "grpcroute"
+	ResourceTypeHTTPRoute ResourceType = "httproute"
+)
+
+var supportedResources = []watchedResource{
 	{
 		gvr: schema.GroupVersionResource{
 			Group:    "networking.k8s.io",
 			Version:  "v1",
 			Resource: "ingresses",
 		},
-		httpPaths: true,
+		typ: ResourceTypeIngress,
 	},
 	{
 		gvr: schema.GroupVersionResource{
@@ -55,8 +56,7 @@ var watchedResources = []watchedResource{
 			Version:  "v1",
 			Resource: "httproutes",
 		},
-		gatewayAPI: true,
-		httpPaths:  true,
+		typ: ResourceTypeHTTPRoute,
 	},
 	{
 		gvr: schema.GroupVersionResource{
@@ -64,8 +64,83 @@ var watchedResources = []watchedResource{
 			Version:  "v1",
 			Resource: "grpcroutes",
 		},
-		gatewayAPI: true,
+		typ: ResourceTypeGRPCRoute,
 	},
+}
+
+func hostMatchesHostname(host string, hostname string) bool {
+	host = strings.ToLower(host)
+	if suffix, ok := strings.CutPrefix(host, "*."); ok {
+		return strings.HasSuffix(hostname, "."+suffix)
+	}
+	return host == hostname
+}
+
+func hostCoversName(host string, name string) bool {
+	host = strings.ToLower(host)
+	if strings.HasPrefix(host, "*.") {
+		return true
+	}
+	return strings.HasPrefix(host, strings.ToLower(name+"."))
+}
+
+type ExtractionResult struct {
+	typ         ResourceType
+	name        string
+	namespace   string
+	hosts       []string
+	annotations map[string]string
+}
+
+type typedItem struct {
+	typ     ResourceType
+	ingress *networking.Ingress
+	route   *gateway.HTTPRoute
+	grpc    *gateway.GRPCRoute
+}
+
+func convertFromUnstructured[T any](obj *unstructured.Unstructured) (*T, error) {
+	var typed *T
+	err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &typed)
+	if err != nil {
+		var zero *T
+		return zero, fmt.Errorf("failed to convert ingress to typed object: %w", err)
+	}
+	return typed, nil
+}
+
+func (ti *typedItem) fromUnstructured(typ ResourceType, obj *unstructured.Unstructured) (*typedItem, error) {
+	switch typ {
+	case ResourceTypeIngress:
+		typed, err := convertFromUnstructured[networking.Ingress](obj)
+		if err != nil {
+			return nil, err
+		}
+		return &typedItem{
+			typ:     ResourceTypeIngress,
+			ingress: typed,
+		}, nil
+	case ResourceTypeHTTPRoute:
+		typed, err := convertFromUnstructured[gateway.HTTPRoute](obj)
+		if err != nil {
+			return nil, err
+		}
+		return &typedItem{
+			typ:   ResourceTypeHTTPRoute,
+			route: typed,
+		}, nil
+	case ResourceTypeGRPCRoute:
+		typed, err := convertFromUnstructured[gateway.GRPCRoute](obj)
+		if err != nil {
+			return nil, err
+		}
+		return &typedItem{
+			typ:  ResourceTypeGRPCRoute,
+			grpc: typed,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown resource type %s", typ)
+	}
 }
 
 type resourceEntry struct {
@@ -73,17 +148,13 @@ type resourceEntry struct {
 	app  model.App
 }
 
-// routedApps holds the apps annotated on a resource along with the hosts that
-// resource routes, which bound the domains those apps may define ACLs for.
 type routedApps struct {
 	hosts   []string
 	entries []resourceEntry
 }
 
-// resourceKey identifies a watched resource. The kind is part of the key
-// because an Ingress and an HTTPRoute may share a name within a namespace.
 type resourceKey struct {
-	resource  string
+	typ       ResourceType
 	namespace string
 	name      string
 }
@@ -91,10 +162,16 @@ type resourceKey struct {
 type KubernetesService struct {
 	log *logger.Logger
 
-	client       dynamic.Interface
-	connected    bool
-	mu           sync.RWMutex
-	resourceApps map[resourceKey]routedApps
+	apps      map[resourceKey]routedApps
+	client    dynamic.Interface
+	mu        sync.RWMutex
+	connected bool
+
+	extractors struct {
+		ingress   *KubernetesIngressExtractor
+		httproute *KubernetesHTTPRouteExtractor
+		grpc      *KubernetesGRPCRouteExtractor
+	}
 }
 
 type KubernetesServiceInput struct {
@@ -117,35 +194,45 @@ func NewKubernetesService(i KubernetesServiceInput) (*KubernetesService, error) 
 	}
 
 	service := &KubernetesService{
-		log:          i.Log,
-		client:       client,
-		resourceApps: make(map[resourceKey]routedApps),
+		log:    i.Log,
+		client: client,
+		apps:   make(map[resourceKey]routedApps),
 	}
 
-	watching := 0
+	service.extractors.ingress = NewKubernetesIngressExtractor(KubernetesIngressExtractorInput{
+		Log: i.Log,
+	})
+	service.extractors.httproute = NewKubernetesHTTPRouteExtractor(KubernetesHTTPRouteExtractorInput{
+		Log: i.Log,
+	})
+	service.extractors.grpc = NewKubernetesGRPCRouteExtractor(KubernetesGRPCRouteExtractorInput{
+		Log: i.Log,
+	})
 
-	for _, res := range watchedResources {
-		accessCtx, accessCancel := context.WithTimeout(i.Ctx, 5*time.Second)
-		_, err := client.Resource(res.gvr).List(accessCtx, metav1.ListOptions{Limit: 1})
-		accessCancel()
+	watchedGVRs := make(map[string]bool)
+
+	for _, res := range supportedResources {
+		ctx, cancel := context.WithTimeout(i.Ctx, 5*time.Second)
+		_, err := client.Resource(res.gvr).List(ctx, metav1.ListOptions{Limit: 1})
+		cancel()
 
 		if err != nil {
 			// The Gateway API CRDs are not installed on every cluster, so a
-			// single unreachable API is not fatal
-			i.Log.App.Warn().Err(err).Str("api", res.api()).Msg("Failed to access API, skipping watcher")
+			// single unreachable resource is not fatal
+			i.Log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Failed to access resource, skipping watcher")
 			continue
 		}
 
-		i.Log.App.Debug().Str("api", res.api()).Msg("Successfully accessed API, starting watcher")
+		i.Log.App.Debug().Str("res", res.pretty()).Msg("Successfully accessed resource, starting watcher")
 
 		i.Ding.Go(func(ctx context.Context) {
 			service.watchGVR(res, ctx)
 		}, ding.RingMajor)
 
-		watching++
+		watchedGVRs[res.gvr.Resource] = true
 	}
 
-	if watching == 0 {
+	if len(watchedGVRs) == 0 {
 		return nil, fmt.Errorf("failed to access any supported kubernetes api (ingresses, httproutes, grpcroutes)")
 	}
 
@@ -158,7 +245,7 @@ func NewKubernetesService(i KubernetesServiceInput) (*KubernetesService, error) 
 func (k *KubernetesService) addResourceEntries(key resourceKey, hosts []string, entries []resourceEntry) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.resourceApps[key] = routedApps{
+	k.apps[key] = routedApps{
 		hosts:   hosts,
 		entries: entries,
 	}
@@ -167,15 +254,12 @@ func (k *KubernetesService) addResourceEntries(key resourceKey, hosts []string, 
 func (k *KubernetesService) removeResource(key resourceKey) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	delete(k.resourceApps, key)
+	delete(k.apps, key)
 }
 
 func (k *KubernetesService) getEntry(domain string, locator func(name string, app *model.App) bool) {
-	v := validators.NewDomainValidator(validators.DomainValidatorOptions{})
-
-	hostname, err := v.SafeHostname(domain)
-	if err != nil {
-		k.log.App.Debug().Err(err).Str("domain", domain).Msg("Domain is invalid, skipping lookup")
+	if !ensureAscii(domain) {
+		k.log.App.Debug().Str("domain", domain).Msg("Domain is invalid, skipping lookup")
 		return
 	}
 
@@ -183,15 +267,13 @@ func (k *KubernetesService) getEntry(domain string, locator func(name string, ap
 	defer k.mu.RUnlock()
 
 	// O(n^2) is not great but the number of resource entries is expected to be small
-	for _, apps := range k.resourceApps {
-		// Only a resource that routes the domain may define its ACLs, otherwise
-		// an app could claim any domain that happens to start with its name
-		if !slices.ContainsFunc(apps.hosts, func(host string) bool {
-			return hostMatches(host, hostname)
+	for _, app := range k.apps {
+		if !slices.ContainsFunc(app.hosts, func(host string) bool {
+			return hostMatchesHostname(host, domain)
 		}) {
 			continue
 		}
-		for _, entry := range apps.entries {
+		for _, entry := range app.entries {
 			if ok := locator(entry.name, &entry.app); ok {
 				return
 			}
@@ -199,230 +281,48 @@ func (k *KubernetesService) getEntry(domain string, locator func(name string, ap
 	}
 }
 
-// hostMatches reports whether hostname is routed by host. It honours the
-// Gateway API wildcard label (`*.`), which is a suffix match, so
-// `*.example.com` matches `test.example.com` and `foo.test.example.com` but
-// not `example.com`.
-func hostMatches(host string, hostname string) bool {
-	host = strings.ToLower(host)
+func (k *KubernetesService) updateFromItem(res watchedResource, typedItem *typedItem) {
+	var result *ExtractionResult
 
-	if suffix, ok := strings.CutPrefix(host, "*."); ok {
-		return strings.HasSuffix(hostname, "."+suffix)
-	}
-
-	return host == hostname
-}
-
-// hostCoversName reports whether an app name could resolve to a host routed by
-// the resource. A wildcard host covers any app name since `*.example.com`
-// routes `<name>.example.com` for every name.
-func hostCoversName(host string, name string) bool {
-	host = strings.ToLower(host)
-
-	if strings.HasPrefix(host, "*.") {
-		return true
-	}
-
-	return strings.HasPrefix(host, strings.ToLower(name+"."))
-}
-
-func (k *KubernetesService) extractPaths(rule map[string]any) ([]string, error) {
-	http, found, err := unstructured.NestedMap(rule, "http")
-	if err != nil {
-		return nil, fmt.Errorf("reading http from rule: %w", err)
-	}
-	if !found {
-		return nil, nil
-	}
-	paths, found, err := unstructured.NestedSlice(http, "paths")
-	if err != nil {
-		return nil, fmt.Errorf("reading http.paths: %w", err)
-	}
-	if !found {
-		return nil, nil
-	}
-	var result []string
-	for _, p := range paths {
-		path, ok := p.(map[string]any)
-		if !ok {
-			continue
-		}
-		if p, ok := path["path"].(string); ok && p != "" {
-			result = append(result, p)
-		}
-	}
-	return result, nil
-}
-
-// extractRoutePaths returns the paths matched by a Gateway API route rule and
-// whether the rule matches every path for its hosts.
-func (k *KubernetesService) extractRoutePaths(rule map[string]any) ([]string, bool, error) {
-	matches, found, err := unstructured.NestedSlice(rule, "matches")
-	if err != nil {
-		return nil, false, fmt.Errorf("reading matches from rule: %w", err)
-	}
-	if !found || len(matches) == 0 {
-		// An omitted matches list defaults to a PathPrefix match on "/"
-		return nil, true, nil
-	}
-	var result []string
-	catchAll := false
-	for _, m := range matches {
-		match, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		path, ok := match["path"].(map[string]any)
-		if !ok {
-			// A match without a path constrains something else, such as headers
-			// or a gRPC method, and leaves the path unrestricted
-			catchAll = true
-			continue
-		}
-		// Both fields are optional and default to a PathPrefix match on "/"
-		pathType, ok := path["type"].(string)
-		if !ok || pathType == "" {
-			pathType = "PathPrefix"
-		}
-		value, ok := path["value"].(string)
-		if !ok || value == "" {
-			value = "/"
-		}
-		result = append(result, value)
-		if pathType == "PathPrefix" && value == "/" {
-			catchAll = true
-		}
-	}
-	return result, catchAll, nil
-}
-
-// warnMissingCatchAllPath warns when a Gateway API route does not match every
-// path for the hosts it routes. Unlike an Ingress, a route declares its hosts
-// once for all of its rules, so the rules are checked as a whole.
-func (k *KubernetesService) warnMissingCatchAllPath(item *unstructured.Unstructured) {
-	rules, found, err := unstructured.NestedSlice(item.Object, "spec", "rules")
-	if err != nil {
-		// This is purely to warn users
-		// It doesn't affect our ability to extract hosts, so we won't fail the whole operation
-		k.log.App.Warn().Err(err).Str("namespace", item.GetNamespace()).Str("name", item.GetName()).Msg("Failed to extract paths from route rules")
-		return
-	}
-	if !found || len(rules) == 0 {
-		return
-	}
-	var paths []string
-	for _, r := range rules {
-		rule, ok := r.(map[string]any)
-		if !ok {
-			continue
-		}
-		rulePaths, catchAll, err := k.extractRoutePaths(rule)
-		if err != nil {
-			k.log.App.Warn().Err(err).Str("namespace", item.GetNamespace()).Str("name", item.GetName()).Msg("Failed to extract paths from route rule")
-			continue
-		}
-		if catchAll {
+	switch typedItem.typ {
+	case ResourceTypeIngress:
+		if typedItem.ingress != nil {
+			k.log.App.Warn().Str("res", res.pretty()).Msg("Ingress is nil, skipping")
 			return
 		}
-		paths = append(paths, rulePaths...)
+		result = k.extractors.ingress.Extract(typedItem.ingress)
+	case ResourceTypeHTTPRoute:
+		if typedItem.route != nil {
+			k.log.App.Warn().Str("res", res.pretty()).Msg("HTTPRoute is nil, skipping")
+			return
+		}
+		result = k.extractors.httproute.Extract(typedItem.route)
+	case ResourceTypeGRPCRoute:
+		if typedItem.grpc != nil {
+			k.log.App.Warn().Str("res", res.pretty()).Msg("GRPCRoute is nil, skipping")
+			return
+		}
+		result = k.extractors.grpc.Extract(typedItem.grpc)
 	}
-	if len(paths) == 0 {
+
+	if result == nil {
+		k.log.App.Warn().Str("res", res.pretty()).Msg("Failed to extract resource, skipping")
 		return
 	}
-	k.log.App.Warn().Str("namespace", item.GetNamespace()).Str("name", item.GetName()).Strs("paths", paths).Msg("Route does not contain a catch-all path, another route may be able to bypass auth checks if it routes the same host with a different path. Consider adding a catch-all path to this route to ensure auth checks are applied to all paths for this host.")
-}
 
-func (k *KubernetesService) extractIngressHosts(item *unstructured.Unstructured) ([]string, error) {
-	rules, found, err := unstructured.NestedSlice(item.Object, "spec", "rules")
-	if err != nil {
-		return nil, fmt.Errorf("reading spec.rules: %w", err)
-	}
-	if !found {
-		return nil, nil
-	}
-	var hosts []string
-	for _, r := range rules {
-		rule, ok := r.(map[string]any)
-		if !ok {
-			continue
-		}
-		if host, ok := rule["host"].(string); ok && host != "" {
-			hosts = append(hosts, host)
-		}
-		paths, err := k.extractPaths(rule)
-		if err != nil {
-			// This is purely to warn users
-			// It doesn't affect our ability to extract hosts, so we won't fail the whole operation
-			k.log.App.Warn().Err(err).Str("namespace", item.GetNamespace()).Str("name", item.GetName()).Msg("Failed to extract paths from ingress rule")
-			continue
-		}
-		if len(paths) == 0 {
-			continue
-		}
-		if !slices.Contains(paths, "/") {
-			k.log.App.Warn().Str("namespace", item.GetNamespace()).Str("name", item.GetName()).Strs("paths", paths).Msg("Ingress rule does not contain a catch-all path, another ingress may be able to bypass auth checks if it routes the same host with a different path. Consider adding a catch-all path to this rule to ensure auth checks are applied to all paths for this host.")
-		}
-	}
-	k.log.App.Trace().Strs("hosts", hosts).Msg("Extracted hosts from ingress rules")
-	return hosts, nil
-}
-
-func (k *KubernetesService) extractRouteHosts(res watchedResource, item *unstructured.Unstructured) ([]string, error) {
-	hostnames, found, err := unstructured.NestedStringSlice(item.Object, "spec", "hostnames")
-	if err != nil {
-		return nil, fmt.Errorf("reading spec.hostnames: %w", err)
-	}
-	if !found {
-		// A route without hostnames inherits the ones of the gateway listeners
-		// it attaches to, which we cannot resolve from the route alone
-		return nil, nil
-	}
-	var hosts []string
-	for _, hostname := range hostnames {
-		if hostname != "" {
-			hosts = append(hosts, hostname)
-		}
-	}
-	if res.httpPaths {
-		k.warnMissingCatchAllPath(item)
-	}
-	k.log.App.Trace().Strs("hosts", hosts).Msg("Extracted hosts from route hostnames")
-	return hosts, nil
-}
-
-func (k *KubernetesService) extractHosts(res watchedResource, item *unstructured.Unstructured) ([]string, error) {
-	if res.gatewayAPI {
-		return k.extractRouteHosts(res, item)
-	}
-	return k.extractIngressHosts(item)
-}
-
-func (k *KubernetesService) updateFromItem(res watchedResource, item *unstructured.Unstructured) {
 	key := resourceKey{
-		resource:  res.gvr.Resource,
-		namespace: item.GetNamespace(),
-		name:      item.GetName(),
+		typ:       res.typ,
+		namespace: result.namespace,
+		name:      result.name,
 	}
 
-	annotations := item.GetAnnotations()
-	if annotations == nil {
+	if len(result.hosts) == 0 {
+		k.log.App.Warn().Str("res", res.pretty()).Str("namespace", key.namespace).Str("name", key.name).Msg("No hosts found in resource, skipping")
 		k.removeResource(key)
 		return
 	}
 
-	hosts, err := k.extractHosts(res, item)
-	if err != nil {
-		k.removeResource(key)
-		return
-	}
-
-	if len(hosts) == 0 {
-		k.log.App.Warn().Str("api", res.api()).Str("namespace", key.namespace).Str("name", key.name).Msg("No hosts found in resource, skipping")
-		k.removeResource(key)
-		return
-	}
-
-	labels, err := decoders.DecodeLabels[model.Apps](annotations, "apps")
+	labels, err := decoders.DecodeLabels[model.Apps](result.annotations, "apps")
 	if err != nil {
 		k.log.App.Warn().Err(err).Str("namespace", key.namespace).Str("name", key.name).Msg("Failed to decode resource labels, skipping")
 		k.removeResource(key)
@@ -431,25 +331,24 @@ func (k *KubernetesService) updateFromItem(res watchedResource, item *unstructur
 
 	var entries []resourceEntry
 
-	v := validators.NewDomainValidator(validators.DomainValidatorOptions{})
-
 	for name, config := range labels.Apps {
 		if config.Config.Domain != "" {
-			hostname, err := v.SafeHostname(config.Config.Domain)
-			if err != nil {
+			if !ensureAscii(config.Config.Domain) {
 				k.log.App.Warn().Err(err).Str("namespace", key.namespace).Str("name", key.name).Str("domain", config.Config.Domain).Msg("Domain is invalid, matching will rely on app name")
-			} else if slices.ContainsFunc(hosts, func(host string) bool {
-				return hostMatches(host, hostname)
-			}) {
-				entries = append(entries, resourceEntry{
-					name: name,
-					app:  config,
-				})
-				continue
+			} else {
+				if slices.ContainsFunc(result.hosts, func(host string) bool {
+					return hostMatchesHostname(host, config.Config.Domain)
+				}) {
+					entries = append(entries, resourceEntry{
+						name: name,
+						app:  config,
+					})
+					continue
+				}
 			}
 		}
 
-		if slices.ContainsFunc(hosts, func(host string) bool {
+		if slices.ContainsFunc(result.hosts, func(host string) bool {
 			return hostCoversName(host, name)
 		}) {
 			entries = append(entries, resourceEntry{
@@ -464,7 +363,7 @@ func (k *KubernetesService) updateFromItem(res watchedResource, item *unstructur
 		return
 	}
 
-	k.addResourceEntries(key, hosts, entries)
+	k.addResourceEntries(key, result.hosts, entries)
 }
 
 func (k *KubernetesService) resyncGVR(res watchedResource, ctx context.Context) error {
@@ -473,18 +372,21 @@ func (k *KubernetesService) resyncGVR(res watchedResource, ctx context.Context) 
 
 	list, err := k.client.Resource(res.gvr).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		k.log.App.Warn().Err(err).Str("api", res.api()).Msg("Failed to list resources for resync")
+		k.log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Failed to list resources for resync")
 		return err
 	}
-	for i := range list.Items {
-		k.updateFromItem(res, &list.Items[i])
+	for _, item := range list.Items {
+		newTypedItem, err := new(typedItem).fromUnstructured(res.typ, &item)
+		if err != nil {
+			k.log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Failed to decode resource, skipping")
+			continue
+		}
+		k.updateFromItem(res, newTypedItem)
 	}
-	k.log.App.Debug().Str("api", res.api()).Int("count", len(list.Items)).Msg("Resync complete")
+	k.log.App.Debug().Str("res", res.pretty()).Int("count", len(list.Items)).Msg("Resync complete")
 	return nil
 }
 
-// runWatcher drains events from an active watcher until it closes or the context is done.
-// Returns true if the caller should restart the watcher, false if it should exit.
 func (k *KubernetesService) runWatcher(res watchedResource, w watch.Interface, resyncTicker *time.Ticker, ctx context.Context) bool {
 	for {
 		select {
@@ -493,29 +395,34 @@ func (k *KubernetesService) runWatcher(res watchedResource, w watch.Interface, r
 			return false
 		case event, ok := <-w.ResultChan():
 			if !ok {
-				k.log.App.Warn().Str("api", res.api()).Msg("Watcher channel closed, restarting watcher")
+				k.log.App.Warn().Str("res", res.pretty()).Msg("Watcher channel closed, restarting watcher")
 				w.Stop()
 				time.Sleep(5 * time.Second)
 				return true
 			}
 			item, ok := event.Object.(*unstructured.Unstructured)
 			if !ok {
-				k.log.App.Warn().Str("api", res.api()).Msg("Received unexpected event object, skipping")
+				k.log.App.Warn().Str("res", res.pretty()).Msg("Received unexpected event object, skipping")
+				continue
+			}
+			newTypedItem, err := new(typedItem).fromUnstructured(res.typ, item)
+			if err != nil {
+				k.log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Failed to decode resource, skipping")
 				continue
 			}
 			switch event.Type {
 			case watch.Added, watch.Modified:
-				k.updateFromItem(res, item)
+				k.updateFromItem(res, newTypedItem)
 			case watch.Deleted:
 				k.removeResource(resourceKey{
-					resource:  res.gvr.Resource,
+					typ:       res.typ,
 					namespace: item.GetNamespace(),
 					name:      item.GetName(),
 				})
 			}
 		case <-resyncTicker.C:
 			if err := k.resyncGVR(res, ctx); err != nil {
-				k.log.App.Warn().Err(err).Str("api", res.api()).Msg("Periodic resync failed during watcher run")
+				k.log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Periodic resync failed during watcher run")
 			}
 		}
 	}
@@ -526,29 +433,29 @@ func (k *KubernetesService) watchGVR(res watchedResource, ctx context.Context) {
 	defer resyncTicker.Stop()
 
 	if err := k.resyncGVR(res, ctx); err != nil {
-		k.log.App.Warn().Err(err).Str("api", res.api()).Msg("Initial resync failed, will retry")
+		k.log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Initial resync failed, will retry")
 		time.Sleep(30 * time.Second)
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			k.log.App.Debug().Str("api", res.api()).Msg("Shutting down kubernetes watcher")
+			k.log.App.Debug().Str("res", res.pretty()).Msg("Shutting down kubernetes watcher")
 			return
 		case <-resyncTicker.C:
 			if err := k.resyncGVR(res, ctx); err != nil {
-				k.log.App.Warn().Err(err).Str("api", res.api()).Msg("Periodic resync failed, will retry")
+				k.log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Periodic resync failed, will retry")
 			}
 		default:
 			ctx, cancel := context.WithCancel(ctx)
 			watcher, err := k.client.Resource(res.gvr).Watch(ctx, metav1.ListOptions{})
 			if err != nil {
-				k.log.App.Warn().Err(err).Str("api", res.api()).Msg("Failed to start watcher, will retry")
+				k.log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Failed to start watcher, will retry")
 				cancel()
 				time.Sleep(10 * time.Second)
 				continue
 			}
-			k.log.App.Debug().Str("api", res.api()).Msg("Watcher started successfully")
+			k.log.App.Debug().Str("res", res.pretty()).Msg("Watcher started successfully")
 			if !k.runWatcher(res, watcher, resyncTicker, ctx) {
 				cancel()
 				return
@@ -558,9 +465,6 @@ func (k *KubernetesService) watchGVR(res watchedResource, ctx context.Context) {
 	}
 }
 
-// Lookup yields the apps annotated on the resources that route domain. Apps
-// annotated on any other resource are withheld, since they are served
-// elsewhere and must not define the ACLs of this domain.
 func (k *KubernetesService) Lookup(domain string, locator func(name string, app *model.App) bool) error {
 	if !k.connected {
 		k.log.App.Debug().Msg("Kubernetes label provider not started, skipping")

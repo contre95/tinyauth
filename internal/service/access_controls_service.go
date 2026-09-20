@@ -46,7 +46,7 @@ func NewAccessControlsService(i AccessControlServiceInput) *AccessControlsServic
 	}
 }
 
-func (service *AccessControlsService) ensureAscii(str string) bool {
+func ensureAscii(str string) bool {
 	for i := 0; i < len(str); i++ {
 		if str[i] > unicode.MaxASCII {
 			return false
@@ -64,7 +64,7 @@ func (service *AccessControlsService) normalizeDomain(domain string) string {
 }
 
 func (service *AccessControlsService) getACLs(domain string, lookup func(locator func(name string, app *model.App) bool) error) (*model.App, error) {
-	if !service.ensureAscii(domain) {
+	if !ensureAscii(domain) {
 		return nil, errors.New("domain contains non-ascii characters")
 	}
 
@@ -80,7 +80,7 @@ func (service *AccessControlsService) getACLs(domain string, lookup func(locator
 
 	locatorFunc := func(name string, app *model.App) bool {
 		if app.Config.Domain != "" {
-			if !service.ensureAscii(app.Config.Domain) {
+			if !ensureAscii(app.Config.Domain) {
 				service.log.App.Warn().Str("name", name).Str("domain", app.Config.Domain).Msg("Domain contains non-ascii characters, skipping")
 				return false
 			}
