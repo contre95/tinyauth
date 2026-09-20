@@ -81,11 +81,9 @@ A huge thank you to [selfh.st](https://selfh.st) for their generous donation to 
 
 - [JetBrains for Open-Source](https://jb.gg/OpenSource)
 - [CodeRabbit AI](https://www.coderabbit.ai)
-- [Dosu](https://dosu.dev/)
-- [InstaPods](https://instapods.com) - [Deploy Tinyauth from 3$/month](https://app.instapods.com/dashboard/pods/create?app=tinyauth&ref=tinyauth)
 
 ## Acknowledgements
 
 - **Freepik** for providing the police hat and badge.
 - **Renee French** for the original gopher logo.
-- **Syrhu** for providing the background image of the app.
+- [Siru Zhou](https://unsplash.com/@syrhu) for providing the background image of the app.

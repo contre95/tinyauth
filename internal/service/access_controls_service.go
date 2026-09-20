@@ -2,11 +2,13 @@ package service
 
 import (
 	"errors"
+	"fmt"
+	"net"
 	"strings"
+	"unicode"
 
 	"github.com/tinyauthapp/tinyauth/internal/model"
 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
-	"github.com/tinyauthapp/tinyauth/pkg/validators"
 	"go.uber.org/dig"
 )
 
@@ -21,6 +23,7 @@ type LabelProvider interface {
 type AccessControlsService struct {
 	log           *logger.Logger
 	config        *model.Config
+	runtime       *model.RuntimeConfig
 	labelProvider LabelProvider
 }
 
@@ -29,6 +32,7 @@ type AccessControlServiceInput struct {
 
 	Log           *logger.Logger
 	Config        *model.Config
+	Runtime       *model.RuntimeConfig
 	LabelProvider LabelProvider `optional:"true"`
 }
 
@@ -37,12 +41,38 @@ func NewAccessControlsService(i AccessControlServiceInput) *AccessControlsServic
 	return &AccessControlsService{
 		log:           i.Log,
 		config:        i.Config,
+		runtime:       i.Runtime,
 		labelProvider: i.LabelProvider,
 	}
 }
 
+func (service *AccessControlsService) ensureAscii(str string) bool {
+	for i := 0; i < len(str); i++ {
+		if str[i] > unicode.MaxASCII {
+			return false
+		}
+	}
+	return true
+}
+
+func (service *AccessControlsService) normalizeDomain(domain string) string {
+	if host, _, err := net.SplitHostPort(domain); err == nil {
+		domain = host
+	}
+	domain = strings.TrimRight(domain, ".")
+	return strings.ToLower(domain)
+}
+
 func (service *AccessControlsService) getACLs(domain string, lookup func(locator func(name string, app *model.App) bool) error) (*model.App, error) {
-	v := validators.NewDomainValidator(validators.DomainValidatorOptions{})
+	if !service.ensureAscii(domain) {
+		return nil, errors.New("domain contains non-ascii characters")
+	}
+
+	normalizedDomain := service.normalizeDomain(domain)
+
+	if !strings.HasSuffix(normalizedDomain, "."+service.runtime.CookieDomain) && normalizedDomain != service.runtime.CookieDomain {
+		return nil, fmt.Errorf("domain does not match cookie domain, expected %s (or a subdomain), got %s", service.runtime.CookieDomain, domain)
+	}
 
 	var domainMatch *model.App
 	var nameMatch *model.App
@@ -50,16 +80,18 @@ func (service *AccessControlsService) getACLs(domain string, lookup func(locator
 
 	locatorFunc := func(name string, app *model.App) bool {
 		if app.Config.Domain != "" {
-			err := v.Validate(app.Config.Domain, domain)
-			if err == nil {
+			if !service.ensureAscii(app.Config.Domain) {
+				service.log.App.Warn().Str("name", name).Str("domain", app.Config.Domain).Msg("Domain contains non-ascii characters, skipping")
+				return false
+			}
+			if normalizedDomain == service.normalizeDomain(app.Config.Domain) {
 				service.log.App.Debug().Str("name", name).Msg("Found matching container by domain")
 				domainMatch = app
 				return true
-			} else if !errors.Is(err, validators.ErrHostnameMismatch) {
-				service.log.App.Debug().Str("name", name).Err(err).Msg("Domain validation failed")
 			}
+			return false
 		}
-		if strings.HasPrefix(strings.ToLower(domain), strings.ToLower(name+".")) {
+		if strings.HasPrefix(normalizedDomain, strings.ToLower(name+".")) {
 			service.log.App.Debug().Str("name", name).Msg("Found matching container by app name")
 			nameMatch = app
 			nameMatchedApps = append(nameMatchedApps, name)
@@ -83,7 +115,7 @@ func (service *AccessControlsService) getACLs(domain string, lookup func(locator
 	}
 
 	if len(nameMatchedApps) > 1 {
-		service.log.App.Warn().Str("domain", domain).Strs("apps", nameMatchedApps).Msg("Multiple apps matched domain by name, app names must be unique, using last match")
+		return nil, fmt.Errorf("domain matched multiple apps by name prefix, use explicit domain config")
 	}
 
 	service.log.App.Debug().Str("domain", domain).Msg("Found matching app by app name")

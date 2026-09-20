@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -52,6 +53,17 @@ const (
 	OIDCPromptLogin OIDCPrompt = "login"
 	OIDCPromptNone  OIDCPrompt = "none"
 )
+
+func (p OIDCPrompt) String() string {
+	switch p {
+	case OIDCPromptLogin:
+		return "login"
+	case OIDCPromptNone:
+		return "none"
+	default:
+		return "login"
+	}
+}
 
 var SupportedPrompts = []string{string(OIDCPromptLogin), string(OIDCPromptNone)}
 
@@ -871,7 +883,7 @@ func (service *OIDCService) ValidatePKCE(codeChallenge string, codeVerifier stri
 	if codeChallenge == "" {
 		return true
 	}
-	return codeChallenge == service.hashAndEncodePKCE(codeVerifier)
+	return subtle.ConstantTimeCompare([]byte(codeChallenge), []byte(service.hashAndEncodePKCE(codeVerifier))) == 1
 }
 
 func (service *OIDCService) hashAndEncodePKCE(codeVerifier string) string {

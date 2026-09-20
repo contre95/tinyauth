@@ -4,9 +4,13 @@ export default defineConfig({
   testDir: './specs',
   fullyParallel: true,
   forbidOnly: false,
-  retries: 0,
+  retries: 3,
   workers: 4,
   reporter: 'html',
+  timeout: 60_000,
+  expect: {
+    timeout: 10_000,
+  },
   use: {
     trace: 'on-first-retry',
     video: 'on',

@@ -102,18 +102,6 @@ func TestDomainValidator_SafeHostname(t *testing.T) {
 			},
 		},
 		{
-			description: "Domains with unicode characters should be allowed",
-			input:       "bücher.example.com",
-			expected:    "xn--bcher-kva.example.com",
-		},
-		{
-			description: "Invalid IDNA domain should fail",
-			input:       "ab--cd.example.com",
-			errorFunc: func(t *testing.T, e error) {
-				assert.ErrorContains(t, e, "invalid label")
-			},
-		},
-		{
 			description: "With port enabled without any port should work",
 			options:     DomainValidatorOptions{WithPort: true},
 			input:       "example.com",
@@ -195,22 +183,6 @@ func TestDomainValidator_Validate(t *testing.T) {
 			actual:      "https://example.com:443",
 		},
 		{
-			description: "Failure to format expected domain should fail",
-			expected:    "ab--cd.example.com",
-			actual:      "example.com",
-			errorFunc: func(t *testing.T, e error) {
-				assert.ErrorContains(t, e, "idna: invalid label")
-			},
-		},
-		{
-			description: "Failure to format check domain should fail",
-			expected:    "example.com",
-			actual:      "ab--cd.example.com",
-			errorFunc: func(t *testing.T, e error) {
-				assert.ErrorContains(t, e, "idna: invalid label")
-			},
-		},
-		{
 			description: "Valid domains with matching schemes and ports should pass",
 			options:     DomainValidatorOptions{WithScheme: true, AllowedSchemes: []string{"https", "http"}, WithPort: true},
 			expected:    "https://example.com:8080",
@@ -235,16 +207,6 @@ func TestDomainValidator_Validate(t *testing.T) {
 			description: "Valid domains without ports or schemes should pass",
 			actual:      "example.com",
 			expected:    "example.com",
-		},
-		{
-			description: "Unicode valid domains should pass",
-			expected:    "xn--bcher-kva.example.com",
-			actual:      "bücher.example.com",
-		},
-		{
-			description: "Unicode valid domains should pass (reverse)",
-			expected:    "bücher.example.com",
-			actual:      "xn--bcher-kva.example.com",
 		},
 		{
 			description: "Non matching hostnames should fail",
