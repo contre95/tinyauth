@@ -55,7 +55,7 @@ func ensureAscii(str string) bool {
 	return true
 }
 
-func (service *AccessControlsService) normalizeDomain(domain string) string {
+func normalizeDomain(domain string) string {
 	if host, _, err := net.SplitHostPort(domain); err == nil {
 		domain = host
 	}
@@ -68,7 +68,7 @@ func (service *AccessControlsService) getACLs(domain string, lookup func(locator
 		return nil, errors.New("domain contains non-ascii characters")
 	}
 
-	normalizedDomain := service.normalizeDomain(domain)
+	normalizedDomain := normalizeDomain(domain)
 
 	if !strings.HasSuffix(normalizedDomain, "."+service.runtime.CookieDomain) && normalizedDomain != service.runtime.CookieDomain {
 		return nil, fmt.Errorf("domain does not match cookie domain, expected %s (or a subdomain), got %s", service.runtime.CookieDomain, domain)
@@ -84,7 +84,7 @@ func (service *AccessControlsService) getACLs(domain string, lookup func(locator
 				service.log.App.Warn().Str("name", name).Str("domain", app.Config.Domain).Msg("Domain contains non-ascii characters, skipping")
 				return false
 			}
-			if normalizedDomain == service.normalizeDomain(app.Config.Domain) {
+			if normalizedDomain == normalizeDomain(app.Config.Domain) {
 				service.log.App.Debug().Str("name", name).Msg("Found matching container by domain")
 				domainMatch = app
 				return true
